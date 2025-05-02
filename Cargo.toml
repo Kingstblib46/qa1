@@ -1,0 +1,19 @@
+[package]
+name = "dogecoin_zkp_generator_qa1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-bls12-381 = "0.4.0"
+ark-ff = "0.4.0"
+ark-ec = "0.4.0"
+# ark-poly = "0.4.0" # 可能不需要直接依赖，由其他库引入
+ark-relations = "0.4.0"
+ark-r1cs-std = "0.4.0"
+ark-groth16 = "0.4.0"
+ark-snark = "0.4.0"
+ark-serialize = "0.4.0"
+ark-std = { version = "0.4.0", default-features = false, features = ["std", "print-trace"] }
+hex = "0.4" # 用于十六进制转换
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
