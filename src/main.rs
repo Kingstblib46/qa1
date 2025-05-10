@@ -5,27 +5,18 @@ use ark_groth16::{
     Groth16, prepare_verifying_key,
 };
 use ark_relations::{
-    r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError},
+    r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable},
     lc,
 };
 use ark_serialize::{CanonicalSerialize, Compress, SerializationError};
 use ark_snark::SNARK;
 use ark_std::rand::{SeedableRng, rngs::StdRng};
 use ark_std::vec::Vec;
-use ark_std::One; // Import the One trait for Fr::one()
+use ark_std::{One, Zero}; // Import the One and Zero traits for Fr::one() and Fr::zero()
 use std::fs::File;
-use std::io::{Read, Write, BufReader, Seek, SeekFrom};
+use std::io::{Write};
 use std::error::Error;
-use std::path::Path;
 use serde_json::json;
-use byteorder::{LittleEndian, ReadBytesExt};
-
-// Simple wrapper for R1CS file data
-struct R1CSFile {
-    num_public_inputs: usize,
-    num_variables: usize,
-    num_constraints: usize,
-}
 
 // Constraint synthesizer for R1CS files
 struct CircuitFromR1CS {
@@ -95,78 +86,28 @@ impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
     }
 }
 
-// Read basic information from the R1CS file
-fn read_r1cs_info(path: &Path) -> Result<R1CSFile, Box<dyn Error>> {
-    println!("Reading R1CS file: {}", path.display());
-    
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    
-    // Read R1CS header (magic number, version, etc.)
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)?;
-    
-    // Skip version info
-    reader.seek(SeekFrom::Current(4))?;
-    
-    // Read section headers to get constraint count, variable count and public input count
-    let num_sections = reader.read_u32::<LittleEndian>()?;
-    
-    let mut num_constraints = 0;
-    let mut num_variables = 0;
-    let mut num_public_inputs = 0;
-    
-    // Basic parsing to extract header info
-    for _ in 0..num_sections {
-        let section_type = reader.read_u32::<LittleEndian>()?;
-        let section_size = reader.read_u64::<LittleEndian>()?;
-        
-        match section_type {
-            1 => {
-                // Header section
-                // Read constraint count (number of constraints)
-                num_constraints = reader.read_u32::<LittleEndian>()? as usize;
-                // Read variable count
-                num_variables = reader.read_u32::<LittleEndian>()? as usize;
-                // Read public input count (includes ONE_WIRE)
-                let total_public = reader.read_u32::<LittleEndian>()? as usize;
-                // Actual public inputs excluding ONE_WIRE
-                num_public_inputs = total_public - 1;
-                
-                // Skip the rest of the header
-                reader.seek(SeekFrom::Current((section_size - 12) as i64))?;
-            },
-            _ => {
-                // Skip other sections
-                reader.seek(SeekFrom::Current(section_size as i64))?;
-            }
-        }
+/// A tiny “iszero” circuit: enforces input * 1 == 0
+struct IsZeroCircuit {
+    pub_input: Fr,
+}
+
+impl ConstraintSynthesizer<Fr> for IsZeroCircuit {
+    fn generate_constraints(
+        self,
+        cs: ConstraintSystemRef<Fr>,
+    ) -> Result<(), SynthesisError> {
+        // allocate the public input
+        let a_var = cs.new_input_variable(|| Ok(self.pub_input))?;
+        // constant 1
+        let one = Fr::one();
+        // enforce a * 1 == 0  ⇒ a == 0
+        cs.enforce_constraint(
+            lc!() + a_var,
+            lc!() + (one, Variable::One),  // use Variable::One for the constant term
+            lc!(),                          // zero
+        )?;
+        Ok(())
     }
-    
-    println!("Successfully parsed R1CS header information");
-    println!("  Constraints: {}", num_constraints);
-    println!("  Variables: {}", num_variables);
-    println!("  Public inputs (excluding ONE): {}", num_public_inputs);
-    
-    // If we fail to get valid data, use default values that work with Dogecoin OP_CHECKZKP
-    if num_public_inputs == 0 || num_variables == 0 {
-        println!("Warning: Using default values for R1CS info");
-        num_public_inputs = 2;  // Mode 0 requires exactly 2 public inputs
-        num_variables = 10;     // Just a reasonable example value
-        num_constraints = 1;    // At least one constraint
-    }
-    
-    // Ensure we have exactly 2 public inputs for Mode 0
-    if num_public_inputs != 2 {
-        println!("Warning: Adjusting public input count to 2 for Mode 0 compatibility");
-        num_public_inputs = 2;
-    }
-    
-    Ok(R1CSFile {
-        num_public_inputs,
-        num_variables,
-        num_constraints,
-    })
 }
 
 // Serialize Fq for G1/G2 coordinates in 48-byte compressed format
@@ -197,57 +138,26 @@ fn serialize_fr_to_32_bytes_le_padded_front(f: &Fr) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Use deterministic seed for reproducible results
     let mut rng = StdRng::seed_from_u64(0u64);
 
-    // 1. Read R1CS file info
-    let r1cs_path = Path::new("/home/administrator/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
-    let r1cs_info = read_r1cs_info(r1cs_path)?;
-    
-    println!("R1CS file info obtained.");
-    println!("Number of public inputs: {}", r1cs_info.num_public_inputs);
-    println!("Number of variables: {}", r1cs_info.num_variables);
-    println!("Number of constraints: {}", r1cs_info.num_constraints);
-    
-    // 2. Create a circuit from the R1CS information
-    let circuit = CircuitFromR1CS::new(r1cs_info.num_public_inputs, r1cs_info.num_variables);
-    
-    // Store public inputs for later use
-    let mut public_inputs = circuit.public_inputs.clone();
-    
-    // 3. Setup - Generate proving and verifying keys
-    println!("Generating Groth16 parameters...");
+    // ==== TEMP: use minimal iszero circuit (a * 1 == 0) ====
+    // one public input = 0
+    let zero = Fr::zero();
+    let public_inputs = vec![zero];
+    let circuit = IsZeroCircuit { pub_input: zero };
+
+    // 1. Setup
+    println!("Generating Groth16 parameters for iszero...");
     let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(circuit, &mut rng)?;
-    println!("Parameters generated.");
-
-    // 4. Create a circuit instance for proving
-    let proving_circuit = CircuitFromR1CS::new(r1cs_info.num_public_inputs, r1cs_info.num_variables);
-    
-    // 5. Generate the proof
-    println!("Generating proof...");
-    let proof = Groth16::<Bls12_381>::prove(&pk, proving_circuit, &mut rng)?;
-    println!("Proof generated.");
-    
-    // 6. Ensure we have exactly 2 public inputs as required by DIP-69 Mode 0
-    while public_inputs.len() < 2 {
-        // Add zero public inputs if needed
-        public_inputs.push(Fr::from(0u64));
-    }
-    // Take only the first 2 inputs if there are more
-    public_inputs.truncate(2);
-    
-    // 7. Local verification
-    println!("Performing local proof verification...");
+    // 2. Prove
+    println!("Generating iszero proof...");
+    let proof = Groth16::<Bls12_381>::prove(&pk, IsZeroCircuit { pub_input: zero }, &mut rng)?;
+    // 3. Local verify
     let pvk = prepare_verifying_key(&vk);
-    let verified = Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof)?;
-    if !verified {
-        return Err("Local proof verification failed!".into());
-    }
-    println!("Proof verified locally.");
+    assert!(Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof)?);
+    println!("iszero proof verified locally.");
 
-    // 8. Serialization according to DIP-69
-    println!("Serializing components for Dogecoin OP_CHECKZKP...");
-
+    // 4. Serialization (exactly as your code does, but note public_inputs.len()==1)
     // 8.1 Serialize Proof components (π_Α, π_Β, π_C) - 8 items
     let mut proof_items_bytes: Vec<Vec<u8>> = Vec::with_capacity(8);
     // π_Α (G1)
@@ -264,11 +174,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     proof_items_bytes.push(serialize_fq_compressed(proof.c.y().unwrap())?);
     assert_eq!(proof_items_bytes.len(), 8);
 
-    // 8.2 Serialize Public Inputs - 2 items
-    let mut public_input_items_bytes: Vec<Vec<u8>> = Vec::with_capacity(2);
+    // 8.2 Serialize Public Inputs - 1 item
+    let mut public_input_items_bytes: Vec<Vec<u8>> = Vec::with_capacity(1);
     public_input_items_bytes.push(serialize_fr_to_32_bytes_le_padded_front(&public_inputs[0]));
-    public_input_items_bytes.push(serialize_fr_to_32_bytes_le_padded_front(&public_inputs[1]));
-    assert_eq!(public_input_items_bytes.len(), 2);
+    assert_eq!(public_input_items_bytes.len(), 1);
 
     // 8.3 Serialize Verifying Key (VK) and chunk - 6 items
     let mut vk_bytes = Vec::new();
@@ -278,7 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     vk.gamma_g2.serialize_compressed(&mut vk_bytes)?;
     vk.delta_g2.serialize_compressed(&mut vk_bytes)?;
     
-    // For 2 public inputs, gamma_abc_g1 length should be 1 (constant term) + 2 (input terms) = 3
+    // For 1 public input, gamma_abc_g1 length should be 1 (constant term) + 1 (input term) = 2
     assert_eq!(vk.gamma_abc_g1.len(), public_inputs.len() + 1, 
                "VK gamma_abc_g1 length mismatch");
                
@@ -286,31 +195,44 @@ fn main() -> Result<(), Box<dyn Error>> {
         g1.serialize_compressed(&mut vk_bytes)?;
     }
     
-    // Check expected size: 48 (alpha_g1) + 96*3 (beta_g2, gamma_g2, delta_g2) + 48*3 (gamma_abc_g1)
-    assert_eq!(vk_bytes.len(), 48 + 96*3 + 48*3, 
-               "Serialized VK size is not 480 bytes");
+    // Check expected size: 48 (alpha_g1) + 96*3 (beta_g2, gamma_g2, delta_g2) + 48*2 (gamma_abc_g1)
+    assert_eq!(vk_bytes.len(), 48 + 96*3 + 48*2, 
+               "Serialized VK size is not 432 bytes");
 
-    // Split VK into 6 chunks of 80 bytes each
-    let vk_chunks: Vec<Vec<u8>> = vk_bytes.chunks(80).map(|chunk| chunk.to_vec()).collect();
+    // Split VK into 6 chunks of 72 bytes each
+    let vk_chunks: Vec<Vec<u8>> = vk_bytes.chunks(72).map(|chunk| chunk.to_vec()).collect();
     assert_eq!(vk_chunks.len(), 6, "VK did not split into 6 chunks");
 
-    // 8.4 Assemble final 17 stack items in Dogecoin script push order (Index 0 to 16)
-    let mut stack_items_bytes: Vec<Vec<u8>> = Vec::with_capacity(17);
-    stack_items_bytes.push(vec![0u8]);                     // Index 0: Mode 0
-    stack_items_bytes.extend_from_slice(&vk_chunks);       // Index 1-6: VK chunks 0-5
-    stack_items_bytes.push(public_input_items_bytes[1].clone()); // Index 7: Public Input 1
-    stack_items_bytes.push(public_input_items_bytes[0].clone()); // Index 8: Public Input 0
-    stack_items_bytes.push(proof_items_bytes[7].clone());  // Index 9: π_C_y
-    stack_items_bytes.push(proof_items_bytes[6].clone());  // Index 10: π_C_x
-    stack_items_bytes.push(proof_items_bytes[5].clone());  // Index 11: π_Β_y_1
-    stack_items_bytes.push(proof_items_bytes[4].clone());  // Index 12: π_Β_y_0
-    stack_items_bytes.push(proof_items_bytes[3].clone());  // Index 13: π_Β_x_1
-    stack_items_bytes.push(proof_items_bytes[2].clone());  // Index 14: π_Β_x_0
-    stack_items_bytes.push(proof_items_bytes[1].clone());  // Index 15: π_Α_y
-    stack_items_bytes.push(proof_items_bytes[0].clone());  // Index 16: π_Α_x
-    assert_eq!(stack_items_bytes.len(), 17, "Incorrect number of final stack items");
+    // 8.4 Assemble final 16 stack items in Dogecoin script push order:
+    //    πA_x, πA_y,
+    //    πB_x0, πB_x1, πB_y0, πB_y1,
+    //    πC_x, πC_y,
+    //    pub_input0,
+    //    vk_chunk0…vk_chunk5,
+    //    mode (0)
+    let mut stack_items_bytes: Vec<Vec<u8>> = Vec::with_capacity(16);
+    // Proof πA
+    stack_items_bytes.push(proof_items_bytes[0].clone());
+    stack_items_bytes.push(proof_items_bytes[1].clone());
+    // Proof πB
+    stack_items_bytes.push(proof_items_bytes[2].clone());
+    stack_items_bytes.push(proof_items_bytes[3].clone());
+    stack_items_bytes.push(proof_items_bytes[4].clone());
+    stack_items_bytes.push(proof_items_bytes[5].clone());
+    // Proof πC
+    stack_items_bytes.push(proof_items_bytes[6].clone());
+    stack_items_bytes.push(proof_items_bytes[7].clone());
+    // Public input
+    stack_items_bytes.push(public_input_items_bytes[0].clone());
+    // VK chunks
+    for chunk in &vk_chunks {
+        stack_items_bytes.push(chunk.clone());
+    }
+    // Mode 0
+    stack_items_bytes.push(vec![0u8]);
+    assert_eq!(stack_items_bytes.len(), 16);
 
-    // 8.5 Convert byte vectors to hex strings
+    // 8.5 Convert to hex strings
     let hex_items: Vec<String> = stack_items_bytes
         .iter()
         .map(|bytes| hex::encode(bytes))
@@ -341,49 +263,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 9.3 Generate Dogecoin script
     println!("Generating Dogecoin scriptPubKey...");
     let mut script_buf = Vec::new();
-    
-    // Iterate over stack items in reverse order (as they will be pushed onto the stack)
-    for hex_item in hex_items.iter().rev() {
-        let item_bytes = hex::decode(hex_item)?;
+    for item_bytes in stack_items_bytes.iter() {
         let item_len = item_bytes.len();
-        
-        // Add appropriate push opcode based on item length
-        if item_len == 1 && item_bytes[0] == 0 {
-            // OP_0 (0x00)
-            script_buf.push(0x00);
-        } else if item_len <= 75 {
-            // Direct push with length prefix
-            script_buf.push(item_len as u8);
-            script_buf.extend_from_slice(&item_bytes);
-        } else if item_len <= 255 {
-            // OP_PUSHDATA1 (0x4c)
-            script_buf.push(0x4c);
-            script_buf.push(item_len as u8);
-            script_buf.extend_from_slice(&item_bytes);
-        } else {
-            // OP_PUSHDATA2 (0x4d) - unlikely to be needed, but included for completeness
-            script_buf.push(0x4d);
-            script_buf.push((item_len & 0xff) as u8);
-            script_buf.push(((item_len >> 8) & 0xff) as u8);
-            script_buf.extend_from_slice(&item_bytes);
+        match item_len {
+            1 if item_bytes[0] == 0 => {
+                // OP_0
+                script_buf.push(0x00);
+            }
+            1..=75 => {
+                // single‐byte push
+                script_buf.push(item_len as u8);
+                script_buf.extend_from_slice(item_bytes);
+            }
+            76..=255 => {
+                // OP_PUSHDATA1
+                script_buf.push(0x4c);
+                script_buf.push(item_len as u8);
+                script_buf.extend_from_slice(item_bytes);
+            }
+            _ => {
+                // OP_PUSHDATA2
+                script_buf.push(0x4d);
+                script_buf.push((item_len & 0xff) as u8);
+                script_buf.push((item_len >> 8) as u8);
+                script_buf.extend_from_slice(item_bytes);
+            }
         }
     }
-    
-    // Append OP_CHECKZKP (0xb9)
+    // finally OP_CHECKZKP
     script_buf.push(0xb9);
-    
-    // Convert to hex string
+
     let script_hex = hex::encode(&script_buf);
-    
-    // Write to file
-    let script_filename = "dogecoin_script.txt";
-    let mut f_script = File::create(script_filename)?;
+    let mut f_script = File::create("dogecoin_script.txt")?;
     writeln!(f_script, "{}", script_hex)?;
-    println!("Dogecoin scriptPubKey hex saved to {}", script_filename);
-    
+    println!("Dogecoin scriptPubKey hex saved to dogecoin_script.txt");
+
     println!("Processing complete!");
-    println!("Successfully integrated R1CS file from path: {}", r1cs_path.display());
-    println!("Generated a compatible dogecoin script with OP_CHECKZKP for the circuit.");
+    println!("Generated a compatible dogecoin script with OP_CHECKZKP for the iszero circuit.");
 
     Ok(())
 }
