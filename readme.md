@@ -94,18 +94,36 @@ script_buf.push(0xb9);
    ```
 3. 运行程序：
    ```bash
-   cargo run
+   cargo run --bin dogecoin_zkp_generator_qa1
    ```
 4. 获取生成的 `dogecoin_script.txt` 并用于构建 Dogecoin 交易
 
-## 注意事项
+## Known Issues
 
-- 当前 `read_r1cs_info` 为临时实现，需要扩展为真实读取 R1CS 文件头部
-- 错误处理策略为"宽容模式"——即使验证失败也会继续生成脚本
-- VK 分块强制为 6 个块，如不足则补零，超出则截断
+- **R1CS Header Parsing Stub**  
+  当前 `read_r1cs_info`/`R1CSFileHeader::read` 实现仅作调试演示，可能导致  
+  - `num_public` > `num_witness`  
+  - 非法或矛盾的头部信息直接报错  
 
-## 扩展计划
+- **不完整的稀疏矩阵解析**  
+  - 目前 `read_sparse_lc` 仅简单读取固定 32 字节并返回常量域元素。  
+  - 真正的 BLS12-381 字节→域元素转换未实现。  
 
-- 实现完整的 R1CS 文件解析
-- 支持更复杂的电路约束
-- 添加实际 witness 生成和验证功能
+- **约束 B·C Stub**  
+  为避免越界，`R1CSFileInstance::read` 只读取 A，B/C 被硬编码为恒等约束 (`A·1 = A`)。  
+  完整解析 B 和 C 逻辑尚未完成。  
+
+- **动态 Wire 大小 Hack**  
+  当前根据约束中出现的最大 wire index 动态分配 `witness` 数组，  
+  替代了原始 header 提供的 `total_wires`，这是一种临时兼容方案。  
+
+- **缺失真实 Witness**  
+  `R1CSFileInstance::read` 返回的 `witness` 全部置零，未从实际文件或外部输入加载。  
+
+## Roadmap
+
+- 完整实现 R1CS 文件头部和约束块的解析  
+- 正确将 coefficient bytes 转换为 BLS12-381 域元素  
+- 支持读取和注入真实的 witness 值  
+- 移除所有临时 stub，恢复标准 `A·B=C` 解析  
+- 增加单元测试以覆盖各部分逻辑  

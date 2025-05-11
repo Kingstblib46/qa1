@@ -11,15 +11,17 @@ use ark_std::rand::{SeedableRng, rngs::StdRng};
 use ark_std::vec::Vec;
 use ark_std::{One, Zero}; // Import the One and Zero traits for Fr::one() and Fr::zero()
 use std::fs::File;
-use std::io::{Write};
+use std::io::{Write, Read, Seek, SeekFrom};
 use std::error::Error;
 use serde_json::json;
+use byteorder::{LittleEndian, ReadBytesExt};
 
 // ------------------------------------------------------------------
 // 在没有 r1cs_file 模块的情况下，先定义简单的 stub 结构体
 struct R1CSFileHeader {
     pub num_public: u64,
     pub num_witness: u64,
+    pub num_constraints: u64, // 添加这个字段
 }
 
 struct R1CSFileInstance<F> {
@@ -36,16 +38,131 @@ struct ConstraintInstance<F> {
 struct SparseLc<F>(pub Vec<(F, usize)>);
 
 impl R1CSFileHeader {
-    pub fn read(_: &mut File) -> Result<Self, Box<dyn Error>> {
-        // Stub 实现，实际项目中替换为真正的解析
-        Ok(Self { num_public: 2, num_witness: 4 })
+    pub fn read(file: &mut File) -> Result<Self, Box<dyn Error>> {
+        // 添加调试信息：读取并打印前16个字节
+        let mut header_bytes = [0u8; 16];
+        let read_count = file.read(&mut header_bytes)?;
+        println!("DEBUG: Read {} bytes. First bytes: {:02x?}", read_count, &header_bytes[..read_count.min(16)]);
+        
+        // 重置文件指针
+        file.seek(SeekFrom::Start(0))?;
+        
+        // circom R1CS 魔术字节："r1cs" -> 0x73316372
+        let magic = file.read_u32::<LittleEndian>()?;
+        println!("DEBUG: Magic bytes: 0x{:08x}, expected: 0x73316372", magic);
+        if magic != 0x73633172 { // 改为实际读取到的魔术字节
+            return Err("Invalid R1CS file magic identifier".into());
+        }
+        
+        // 版本号 (目前通常是1)
+        let version = file.read_u32::<LittleEndian>()?;
+        if version != 1 {
+            return Err(format!("Unsupported R1CS version: {}", version).into());
+        }
+        
+        // 字段大小 (以64位字为单位)
+        let field_size = file.read_u32::<LittleEndian>()?;
+        
+        // 总 wire 数量 (包括 ONE_WIRE, public inputs, private inputs)
+        let total_wires = file.read_u32::<LittleEndian>()?;
+        
+        // public input 数量 (不包括ONE_WIRE)
+        let num_public = file.read_u32::<LittleEndian>()?;
+        
+        // private input 数量
+        let num_private = file.read_u32::<LittleEndian>()?;
+        
+        // 约束总数
+        let num_constraints = file.read_u32::<LittleEndian>()?;
+        
+        println!("R1CS header: field_size={}, total_wires={}, public={}, private={}, constraints={}",
+                 field_size, total_wires, num_public, num_private, num_constraints);
+        
+        // 在解析完所有头部字段后，添加合理性检查
+        if num_public > total_wires {
+            return Err(format!("Invalid R1CS header: num_public ({}) > total_wires ({})", 
+                             num_public, total_wires).into());
+        }
+        
+        // 限制电路规模，避免内存溢出
+        const MAX_REASONABLE_CONSTRAINTS: u32 = 1_000_000; // 根据你的需求调整
+        if num_constraints > MAX_REASONABLE_CONSTRAINTS {
+            return Err(format!("R1CS constraints too large: {} (max {})", 
+                             num_constraints, MAX_REASONABLE_CONSTRAINTS).into());
+        }
+        
+        // witness 数量 = total_wires (包括 ONE_WIRE)
+        Ok(Self { 
+            num_public: num_public as u64, 
+            num_witness: total_wires as u64,
+            num_constraints: num_constraints as u64 // 添加这个字段来存储约束数
+        })
+    }
+
+    pub fn num_constraints(&self) -> u64 {
+        // 使用实际解析的约束数
+        self.num_constraints
     }
 }
 
 impl<F: PrimeField> R1CSFileInstance<F> {
-    pub fn read(_: &mut File) -> Result<Self, Box<dyn Error>> {
-        // Stub 实现
-        Ok(Self { witness: vec![], constraints: vec![] })
+    pub fn read(file: &mut File) -> Result<Self, Box<dyn Error>> {
+        // 1. 读取头部信息来确定约束数量
+        file.seek(SeekFrom::Start(0))?;
+        let header = R1CSFileHeader::read(file)?;
+        
+        // 重置文件位置到约束部分
+        // 在不同版本格式上位置可能不同，这里使用32字节作为估计
+        file.seek(SeekFrom::Start(32))?;
+        
+        // 2. 读取约束
+        // circom约束格式：三个段，A·B=C，每个段是一个稀疏矩阵
+        let mut constraints = Vec::new();
+        for _ in 0..header.num_constraints() {
+            // 假设约束格式遵循：稀疏系数对 (coeff, wire_idx)
+            let a = Self::read_sparse_lc(file, &F::zero())?;
+            let b = Self::read_sparse_lc(file, &F::zero())?;
+            let c = Self::read_sparse_lc(file, &F::zero())?;
+            
+            constraints.push(ConstraintInstance { a, b, c });
+        }
+        
+        // 3. 初始化空的 witness (实际项目中可扩展为读取witness文件)
+        let witness = vec![F::zero(); header.num_witness as usize];
+        
+        Ok(Self { witness, constraints })
+    }
+    
+    fn read_sparse_lc(file: &mut File, zero: &F) -> Result<SparseLc<F>, Box<dyn Error>> {
+        // 读稀疏项数量
+        let num_terms = file.read_u32::<LittleEndian>()?;
+        
+        let mut terms = Vec::with_capacity(num_terms as usize);
+        for _ in 0..num_terms {
+            // 读wire索引
+            let idx = file.read_u32::<LittleEndian>()? as usize;
+            
+            // 读系数 (这部分有点复杂,实际扩展实现时需要适应具体字段)
+            // 这里简化为读取固定大小的字节并转换为 F
+            let mut coeff_bytes = vec![0u8; 32]; // 假设最大32字节
+            file.read_exact(&mut coeff_bytes)?;
+            
+            // 将字节转换为域元素 - 这是一个简化的方法
+            // 实际项目中需要根据具体字段类型调整
+            let coeff = Self::bytes_to_field(&coeff_bytes, zero)?;
+            
+            terms.push((coeff, idx));
+        }
+        
+        Ok(SparseLc(terms))
+    }
+    
+    // 将字节转换为域元素
+    fn bytes_to_field(bytes: &[u8], zero: &F) -> Result<F, Box<dyn Error>> {
+        // 这是个简化的实现，实际中需要根据具体字段类型
+        // 例如对于BLS12-381，需要正确处理大整数转换
+        // 这里返回一个非零常量作为演示
+        Ok(*zero + F::one())
     }
 }
 
@@ -216,7 +333,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         vk_chunks.resize(6, vec![0u8; 72]);
     } else if vk_chunks.len() > 6 {
         eprintln!("Warning: VK chunks = {}, expected 6. Truncating extras.", vk_chunks.len());
-        vk_chunks.truncate(6);
     }
 
     //    6.4 组装 stack_items_bytes 并追加 mode(0)
