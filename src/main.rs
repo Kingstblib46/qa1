@@ -4,10 +4,7 @@ use ark_ec::AffineRepr;
 use ark_groth16::{
     Groth16, prepare_verifying_key,
 };
-use ark_relations::{
-    r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable},
-    lc,
-};
+use ark_relations::{lc, r1cs::{ConstraintSystemRef, ConstraintSynthesizer, SynthesisError, Variable, LinearCombination}}; // lc! 宏
 use ark_serialize::{CanonicalSerialize, Compress, SerializationError};
 use ark_snark::SNARK;
 use ark_std::rand::{SeedableRng, rngs::StdRng};
@@ -18,143 +15,143 @@ use std::io::{Write};
 use std::error::Error;
 use serde_json::json;
 
-// Constraint synthesizer for R1CS files
+// ------------------------------------------------------------------
+// 在没有 r1cs_file 模块的情况下，先定义简单的 stub 结构体
+struct R1CSFileHeader {
+    pub num_public: u64,
+    pub num_witness: u64,
+}
+
+struct R1CSFileInstance<F> {
+    pub witness: Vec<F>,
+    pub constraints: Vec<ConstraintInstance<F>>,
+}
+
+struct ConstraintInstance<F> {
+    pub a: SparseLc<F>,
+    pub b: SparseLc<F>,
+    pub c: SparseLc<F>,
+}
+
+struct SparseLc<F>(pub Vec<(F, usize)>);
+
+impl R1CSFileHeader {
+    pub fn read(_: &mut File) -> Result<Self, Box<dyn Error>> {
+        // Stub 实现，实际项目中替换为真正的解析
+        Ok(Self { num_public: 2, num_witness: 4 })
+    }
+}
+
+impl<F: PrimeField> R1CSFileInstance<F> {
+    pub fn read(_: &mut File) -> Result<Self, Box<dyn Error>> {
+        // Stub 实现
+        Ok(Self { witness: vec![], constraints: vec![] })
+    }
+}
+
+impl<F: PrimeField> SparseLc<F> {
+    pub fn to_linear_combination(
+        &self,
+        one_var: &Variable,
+        pub_vars: &[Variable],
+        priv_vars: &[Variable],
+    ) -> Result<LinearCombination<F>, SynthesisError> {
+        let mut lc = lc!();
+        for (coeff, idx) in &self.0 {
+            let var = match *idx {
+                0 => Variable::One,
+                i if i <= pub_vars.len() => pub_vars[i-1],
+                i => priv_vars[i-1-pub_vars.len()],
+            };
+            lc = lc + (*coeff, var);
+        }
+        Ok(lc)
+    }
+}
+// ------------------------------------------------------------------
+
+// 序列化助手：压缩 G1/G2 坐标 和 32-byte LE 公共输入
+fn serialize_fq_compressed<F: ark_ff::PrimeField>(
+    e: &F,
+) -> Result<Vec<u8>, ark_serialize::SerializationError> {
+    let mut buf = Vec::new();
+    e.serialize_compressed(&mut buf)?;
+    Ok(buf)
+}
+
+fn serialize_fr_to_32_bytes_le_padded_front(
+    f: &ark_bls12_381::Fr,
+) -> Vec<u8> {
+    let mut v = f.into_bigint().to_bytes_le();
+    v.resize(32, 0);
+    v
+}
+// ------------------------------------------------------------------
+
+/// 从 .r1cs 文件读取 header，返回 (public_inputs_count, total_wires)
+fn read_r1cs_info(path: &str) -> Result<(usize, usize), Box<dyn Error>> {
+    let mut f = File::open(path)?;
+    let header = R1CSFileHeader::read(&mut f)?;
+    // header.num_public 不含 ONE_WIRE，header.num_witness 含 ONE_WIRE
+    Ok((header.num_public as usize, header.num_witness as usize))
+}
+
+/// 将 R1CSFileInstance 转成 Arkworks 电路
 struct CircuitFromR1CS {
+    path: String,
     public_inputs: Vec<Fr>,
-    witness: Vec<Fr>,
 }
 
 impl CircuitFromR1CS {
-    // Create a new circuit with default values
-    fn new(num_public_inputs: usize, num_variables: usize) -> Self {
-        let mut witness = vec![Fr::one()]; // First witness is always 1 (ONE_WIRE)
-        
-        // Fill with public inputs (we'll use some test values)
-        for i in 0..num_public_inputs {
-            witness.push(Fr::from(i as u64 + 1));
-        }
-        
-        // Fill remaining private inputs with dummy values
-        let private_inputs = num_variables - num_public_inputs - 1;
-        for i in 0..private_inputs {
-            witness.push(Fr::from(i as u64 + 42));
-        }
-        
-        // Extract public inputs (excluding ONE_WIRE)
-        let public_inputs = witness[1..num_public_inputs+1].to_vec();
-        
-        CircuitFromR1CS {
-            public_inputs,
-            witness,
-        }
+    fn new(path: String, public_inputs: Vec<Fr>) -> Self {
+        Self { path, public_inputs }
     }
 }
 
 impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
-    fn generate_constraints(
-        self,
-        cs: ConstraintSystemRef<Fr>, // Fixed: Changed from &mut ConstraintSystem<Fr> to ConstraintSystemRef<Fr>
-    ) -> Result<(), SynthesisError> {
-        // Allocate variables based on witness values
-        let mut variables = Vec::with_capacity(self.witness.len());
-        
-        // ONE_WIRE is always the first variable
-        variables.push(cs.new_input_variable(|| Ok(Fr::one()))?);
-        
-        // Allocate public input variables
-        for i in 0..self.public_inputs.len() {
-            let idx = i + 1; // +1 because ONE_WIRE is at index 0
-            variables.push(cs.new_input_variable(|| Ok(self.witness[idx]))?);
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // 1. 读实例
+        let mut f = File::open(&self.path).map_err(|_| SynthesisError::AssignmentMissing)?;
+        let inst = R1CSFileInstance::<Fr>::read(&mut f)
+            .map_err(|_| SynthesisError::AssignmentMissing)?;
+
+        // 2. 分配 ONE_WIRE
+        let one_var = cs.new_witness_variable(|| Ok(Fr::one()))?;
+        // 3. 分配公有输入
+        let mut pub_vars = Vec::with_capacity(self.public_inputs.len());
+        for inp in &self.public_inputs {
+            pub_vars.push(cs.new_input_variable(|| Ok(*inp))?);
         }
-        
-        // Allocate remaining private variables
-        for i in (self.public_inputs.len() + 1)..self.witness.len() {
-            variables.push(cs.new_witness_variable(|| Ok(self.witness[i]))?);
+        // 4. 分配私有 witness（跳过第0个 ONE_WIRE）
+        let mut priv_vars = Vec::new();
+        for w in inst.witness.iter().skip(1) {
+            priv_vars.push(cs.new_witness_variable(|| Ok(*w))?);
         }
 
-        // 增加一个恒真的约束：ONE_WIRE * ONE_WIRE = ONE_WIRE
-        cs.enforce_constraint(
-            lc!() + variables[0],  // ONE_WIRE
-            lc!() + variables[0],  // ONE_WIRE
-            lc!() + variables[0],  // ONE_WIRE
-        )?;
-
+        // 5. 遍历约束 A·B = C
+        for con in inst.constraints {
+            // build linear-comb for A、B、C
+            let la = con.a.to_linear_combination(&one_var, &pub_vars, &priv_vars)?;
+            let lb = con.b.to_linear_combination(&one_var, &pub_vars, &priv_vars)?;
+            let lc_ = con.c.to_linear_combination(&one_var, &pub_vars, &priv_vars)?;
+            cs.enforce_constraint(la, lb, lc_)?;
+        }
         Ok(())
     }
-}
-
-/// A tiny “iszero” circuit: enforces input * 1 == 0
-struct IsZeroCircuit {
-    pub_input: Fr,
-}
-
-impl ConstraintSynthesizer<Fr> for IsZeroCircuit {
-    fn generate_constraints(
-        self,
-        cs: ConstraintSystemRef<Fr>,
-    ) -> Result<(), SynthesisError> {
-        // allocate the public input
-        let a_var = cs.new_input_variable(|| Ok(self.pub_input))?;
-        // constant 1
-        let one = Fr::one();
-        // enforce a * 1 == 0  ⇒ a == 0
-        cs.enforce_constraint(
-            lc!() + a_var,
-            lc!() + (one, Variable::One),  // use Variable::One for the constant term
-            lc!(),                          // zero
-        )?;
-        Ok(())
-    }
-}
-
-// Serialize Fq for G1/G2 coordinates in 48-byte compressed format
-fn serialize_fq_compressed(f: &Fq) -> Result<Vec<u8>, SerializationError> {
-    let mut bytes = Vec::with_capacity(f.compressed_size());
-    f.serialize_with_mode(&mut bytes, Compress::Yes)?;
-    if bytes.len() != 48 {
-        eprintln!("Warning: Fq compressed size is not 48 bytes, but {}", bytes.len());
-        return Err(SerializationError::InvalidData);
-    }
-    Ok(bytes)
-}
-
-// Serialize Fr to 32-byte little-endian format with front padding
-fn serialize_fr_to_32_bytes_le_padded_front(f: &Fr) -> Vec<u8> {
-    let fr_bytes_le = f.into_bigint().to_bytes_le();
-    let target_len = 32;
-    let mut padded_bytes = vec![0u8; target_len]; // Initialize with zeros
-
-    // Copy fr_bytes_le to the end of padded_bytes (front padding)
-    let start_index = target_len.saturating_sub(fr_bytes_le.len());
-    for (i, byte) in fr_bytes_le.iter().enumerate() {
-        if start_index + i < target_len {
-             padded_bytes[start_index + i] = *byte;
-        }
-    }
-    padded_bytes
-}
-
-// 最小 stub，用于返回 (public_inputs, variables)
-fn read_r1cs_info(_path: &str) -> Result<(usize, usize), Box<dyn Error>> {
-    // TODO: 这里替换为真正的 R1CS header 解析逻辑
-    Ok((2, 4))  // 临时硬编码：2 个公有输入，4 个变量
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut rng = StdRng::seed_from_u64(0u64);
 
     // 1. 从 R1CS 文件读取电路参数
-    let r1cs_path = "/home/administrator/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs";
+    let r1cs_path = "/home/administrator/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs".to_string();
     println!("Reading R1CS file: {}", r1cs_path);
-    let (num_pub, num_vars) = read_r1cs_info(r1cs_path)?;
-    println!(
-        "R1CS info: {} public inputs, {} variables",
-        num_pub, num_vars
-    );
+    let (num_pub, _) = read_r1cs_info(&r1cs_path)?;
+    // 默认为全 0 公有输入，也可以按需要改成真实 input
+    let public_inputs = vec![Fr::zero(); num_pub];
 
     // 2. 用 CircuitFromR1CS 构造电路
-    let circuit = CircuitFromR1CS::new(num_pub, num_vars);
-    let public_inputs = circuit.public_inputs.clone();
+    let circuit = CircuitFromR1CS::new(r1cs_path.clone(), public_inputs.clone());
 
     // 3. Groth16 Setup
     println!("Running Groth16 setup for R1CS circuit...");
@@ -162,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 4. 生成证明
     println!("Generating proof for R1CS circuit...");
     // 重新构造一次电路实例以生成证明
-    let circuit_prove = CircuitFromR1CS::new(num_pub, num_vars);
+    let circuit_prove = CircuitFromR1CS::new(r1cs_path.clone(), public_inputs.clone());
     let proof = Groth16::<Bls12_381>::prove(&pk, circuit_prove, &mut rng)?;
     // 5. 本地验证
     let pvk = prepare_verifying_key(&vk);
