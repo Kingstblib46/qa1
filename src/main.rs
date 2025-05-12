@@ -202,8 +202,18 @@ fn main() -> io::Result<()> {
     let r1cs_path = PathBuf::from("/home/administrator/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
     println!("尝试读取文件: {}", r1cs_path.display());
     
-    // 读取R1CS文件 - 现在会使用真实文件的元数据和硬编码的约束
-    let r1cs_file = r1cs::read_r1cs_file(&r1cs_path)?;
+    // 尝试读取R1CS文件，如果失败则使用硬编码约束
+    let r1cs_file = match r1cs::read_r1cs_file(&r1cs_path) {
+        Ok(file) => {
+            println!("✅ 成功从文件读取R1CS约束");
+            file
+        },
+        Err(e) => {
+            println!("⚠️ 读取R1CS文件失败: {}", e);
+            println!("💡 使用硬编码约束作为备份");
+            r1cs::create_hardcoded_r1cs()?
+        }
+    };
     
     println!("R1CS信息: {} 个公共输入和 {} 条线路", 
              r1cs_file.num_public_inputs, r1cs_file.num_wires);
