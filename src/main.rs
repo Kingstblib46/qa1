@@ -27,9 +27,46 @@ impl CircuitFromR1CS {
             witness_values[4] = Fr::from(42u64); // x4 可以是任意值，因为 x1=0
         }
         
-        println!("Witness values set to satisfy constraints:");
+        println!("设置满足约束的witness值:");
         for (i, val) in witness_values.iter().enumerate() {
             println!("  x{} = {:?}", i, val);
+        }
+        
+        // 验证witness是否满足所有约束
+        println!("验证witness是否满足所有约束:");
+        for (i, constraint) in r1cs_file.constraints.iter().enumerate() {
+            let mut a_eval = Fr::zero();
+            for (idx, coeff) in &constraint.a_terms {
+                if *idx < witness_values.len() as u32 {
+                    let term = fr_from_bytes(coeff) * witness_values[*idx as usize];
+                    a_eval += term;
+                }
+            }
+            
+            let mut b_eval = Fr::zero();
+            if constraint.b_terms.is_empty() {
+                b_eval = Fr::one(); // 如果B项为空，使用1
+            } else {
+                for (idx, coeff) in &constraint.b_terms {
+                    if *idx < witness_values.len() as u32 {
+                        let term = fr_from_bytes(coeff) * witness_values[*idx as usize];
+                        b_eval += term;
+                    }
+                }
+            }
+            
+            let mut c_eval = Fr::zero();
+            for (idx, coeff) in &constraint.c_terms {
+                if *idx < witness_values.len() as u32 {
+                    let term = fr_from_bytes(coeff) * witness_values[*idx as usize];
+                    c_eval += term;
+                }
+            }
+            
+            let a_times_b = a_eval * b_eval;
+            let satisfied = a_times_b == c_eval;
+            println!("  约束 #{}: A({:?}) * B({:?}) = C({:?}) => {}", 
+                     i, a_eval, b_eval, c_eval, if satisfied { "满足✓" } else { "不满足✗" });
         }
         
         Self {
@@ -165,26 +202,20 @@ fn main() -> io::Result<()> {
     let r1cs_path = PathBuf::from("/home/administrator/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
     println!("尝试读取文件: {}", r1cs_path.display());
     
-    // 读取R1CS文件
-    let r1cs_file = match r1cs::read_r1cs_file(&r1cs_path) {
-        Ok(file) => file,
-        Err(e) => {
-            println!("读取R1CS文件失败: {}", e);
-            // 使用硬编码的方式创建
-            println!("使用硬编码的方式创建R1CS文件");
-            r1cs::create_hardcoded_r1cs()?
-        }
-    };
+    // 读取R1CS文件 - 现在会使用真实文件的元数据和硬编码的约束
+    let r1cs_file = r1cs::read_r1cs_file(&r1cs_path)?;
     
-    println!("R1CS has {} public inputs and {} total wires", 
+    println!("R1CS信息: {} 个公共输入和 {} 条线路", 
              r1cs_file.num_public_inputs, r1cs_file.num_wires);
     
     // 记录公共输入数量以便后续使用
     let num_public_inputs = r1cs_file.num_public_inputs;
     
     // 从R1CS创建电路
-    println!("Using {} public inputs", r1cs_file.num_public_inputs);
-    println!("Creating circuit from R1CS...");
+    println!("使用 {} 个公共输入", r1cs_file.num_public_inputs);
+    println!("从R1CS创建电路...");
+    
+    // 电路的witness值需要满足所有4个约束
     let circuit = CircuitFromR1CS::new(r1cs_file);
     
     // 运行Groth16设置
