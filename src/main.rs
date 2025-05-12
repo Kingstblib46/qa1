@@ -17,21 +17,19 @@ struct CircuitFromR1CS {
 impl CircuitFromR1CS {
     fn new(r1cs_file: r1cs::R1CSFile) -> Self {
         let mut witness_values = vec![Fr::zero(); r1cs_file.num_wires as usize];
-        // 设置 witness[0] 为 ONE (R1CS 的约定)
-        witness_values[0] = Fr::one();
         
-        // 设置一些随机输入值用于测试
-        if witness_values.len() > 1 {
-            witness_values[1] = Fr::from(42u64);
-        }
-        if witness_values.len() > 2 {
-            witness_values[2] = Fr::from(123u64);
-        }
-        if witness_values.len() > 3 {
-            witness_values[3] = Fr::from(456u64);
-        }
+        // 设置满足约束的witness值
+        witness_values[0] = Fr::one();  // ONE_WIRE (约定)
+        witness_values[1] = Fr::zero(); // x1 = 0，满足约束1: x4 * x1 = 0
+        witness_values[2] = Fr::zero(); // x2 = 0，满足约束2: ((p * x0) + x4) * x2 = 0
+        witness_values[3] = Fr::zero(); // x3 = 0，满足约束3和4
         if witness_values.len() > 4 {
-            witness_values[4] = Fr::from(789u64);
+            witness_values[4] = Fr::from(42u64); // x4 可以是任意值，因为 x1=0
+        }
+        
+        println!("Witness values set to satisfy constraints:");
+        for (i, val) in witness_values.iter().enumerate() {
+            println!("  x{} = {:?}", i, val);
         }
         
         Self {
@@ -228,13 +226,14 @@ fn main() -> io::Result<()> {
     // 添加ONE作为第一个输入
     public_inputs.push(Fr::one());
     
-    // 添加其他公共输入 (如果有)
-    public_inputs.push(Fr::from(42u64)); // 使用与证明时相同的值
+    // 添加公共输入x1 (使用与证明时相同的值)
+    public_inputs.push(Fr::zero()); // x1 = 0
     if num_public_inputs > 1 {
-        public_inputs.push(Fr::from(123u64));
+        public_inputs.push(Fr::zero()); // x2 = 0 (如果需要)
     }
-    
+
     println!("Public inputs vector size: {}", public_inputs.len());
+    println!("Public inputs: {:?}", public_inputs);
     
     let pvk = prepare_verifying_key(&params.vk);
     let verified = Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof)
