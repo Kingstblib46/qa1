@@ -23,25 +23,33 @@ impl CircuitFromR1CS {
         // Set ONE wire
         witness_values[0] = Fr::one();
         
-        // For demonstration, set simple values for public inputs
-        // In a real scenario, these would be the actual input values
-        for i in 1..=r1cs.num_public_values() as usize {
+        // For demonstration, set simple values for public inputs/outputs
+        // In a real scenario with WASM, these would be calculated
+        
+        // For BinSum, we'll set more appropriate values based on expected behavior
+        // Public outputs (wires 1-3) represent binary sum results
+        for i in 1..=r1cs.num_public_outputs() as usize {
             if i < witness_values.len() {
                 witness_values[i] = Fr::from(i as u64);
             }
         }
         
-        // For private inputs, set some sample values
+        // Any public inputs (none in this case)
+        for i in (r1cs.num_public_outputs() as usize + 1)..=(r1cs.num_public_outputs() as usize + r1cs.num_public_inputs() as usize) {
+            if i < witness_values.len() {
+                witness_values[i] = Fr::from((i * 2) as u64);
+            }
+        }
+        
+        // For private inputs (wires 4-7), set reasonable values
+        // Private inputs often represent the "actual calculation inputs"
         for i in (r1cs.num_public_values() as usize + 1)..num_wires {
-            witness_values[i] = Fr::from((i * 10) as u64);
+            witness_values[i] = Fr::from((i as u64) % 3); // Simple pattern that should satisfy constraints
         }
         
         println!("Initialized witness values:");
-        for (i, val) in witness_values.iter().enumerate().take(10) {
+        for (i, val) in witness_values.iter().enumerate().take(num_wires) {
             println!("  x{} = {:?}", i, val);
-        }
-        if num_wires > 10 {
-            println!("  ... and {} more values", num_wires - 10);
         }
         
         Self {
@@ -153,7 +161,7 @@ impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
 
 fn main() -> io::Result<()> {
     // Use the hardcoded path directly without any search logic
-    let r1cs_path = PathBuf::from("/Users/hiranokaoru/localwork/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
+    let r1cs_path = PathBuf::from("/Users/hiranokaoru/localwork/work/circomlib-cff5ab6/BinSum@binsum.r1cs");
     println!("📂 Using R1CS file: {}", r1cs_path.display());
     
     // Parse the R1CS file
