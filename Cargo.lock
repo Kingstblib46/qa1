@@ -340,6 +340,7 @@ dependencies = [
  "ark-std",
  "byteorder",
  "hex",
+ "r1cs-file",
  "serde",
  "serde_json",
 ]
@@ -479,6 +480,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "r1cs-file"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebca3c911be03b44e77daff45a6afb885ce10364823a32a7ff45f04829466db8"
+dependencies = [
+ "byteorder",
 ]
 
 [[package]]
