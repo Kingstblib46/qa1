@@ -151,97 +151,9 @@ impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
     }
 }
 
-// Try to find a file with the given name in various locations
-fn find_file(filename: &str) -> Option<PathBuf> {
-    // List of possible directories to search
-    let search_dirs = [
-        "/home/administrator/work",
-        "/home/administrator/work/circomlib-cff5ab6",
-        "/home/administrator",
-        ".",
-        "./work",
-        "../work",
-        "/home/administrator/qa1",
-        "/tmp",
-    ];
-    
-    // First, try exact paths
-    let exact_paths = [
-        format!("/home/administrator/work/circomlib-cff5ab6/{}", filename),
-        format!("/home/administrator/work/{}", filename),
-        format!("/home/administrator/{}", filename),
-        format!("./{}", filename),
-    ];
-    
-    for path_str in exact_paths.iter() {
-        let path = PathBuf::from(path_str);
-        if path.exists() {
-            println!("Found file at exact path: {}", path.display());
-            return Some(path);
-        }
-    }
-    
-    // Try to find the file recursively
-    for dir in search_dirs.iter() {
-        let dir_path = PathBuf::from(dir);
-        if !dir_path.exists() || !dir_path.is_dir() {
-            continue;
-        }
-        
-        // Try to find file directly in this directory
-        let file_path = dir_path.join(filename);
-        if file_path.exists() {
-            println!("Found file in directory: {}", file_path.display());
-            return Some(file_path);
-        }
-        
-        // Try to recursively search (with depth limit)
-        if let Ok(entries) = fs::read_dir(&dir_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check one level down
-                    let nested_file = path.join(filename);
-                    if nested_file.exists() {
-                        println!("Found file in subdirectory: {}", nested_file.display());
-                        return Some(nested_file);
-                    }
-                }
-            }
-        }
-    }
-    
-    None
-}
-
 fn main() -> io::Result<()> {
-    println!("🔍 Searching for R1CS file...");
-    
-    // Try to find the multiplexer.r1cs file
-    let r1cs_filename = "multiplexer.r1cs";
-    let r1cs_path = match find_file(r1cs_filename) {
-        Some(path) => path,
-        None => {
-            // Also try Decoder@multiplexer.r1cs
-            let alt_filename = "Decoder@multiplexer.r1cs";
-            match find_file(alt_filename) {
-                Some(path) => path,
-                None => {
-                    println!("❌ Could not find R1CS file. Looked for:");
-                    println!("   - {}", r1cs_filename);
-                    println!("   - {}", alt_filename);
-                    println!("Please place an R1CS file in one of the search directories.");
-                    
-                    // Return a descriptive error
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "R1CS file not found in any of the search locations"
-                    ));
-                }
-            }
-        }
-    };
-    
+    // Use the hardcoded path directly without any search logic
+    let r1cs_path = PathBuf::from("/Users/hiranokaoru/localwork/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
     println!("📂 Using R1CS file: {}", r1cs_path.display());
     
     // Parse the R1CS file
@@ -252,31 +164,6 @@ fn main() -> io::Result<()> {
         },
         Err(e) => {
             println!("❌ Failed to read R1CS file: {}", e);
-            
-            // If the file exists but parsing failed, print more detailed information
-            if r1cs_path.exists() {
-                if let Ok(metadata) = fs::metadata(&r1cs_path) {
-                    println!("   File exists and is {} bytes", metadata.len());
-                    
-                    // Try to read the first few bytes to check if it's a valid R1CS file
-                    if let Ok(mut file) = fs::File::open(&r1cs_path) {
-                        use std::io::Read;
-                        let mut buffer = [0; 8];
-                        if let Ok(n) = file.read(&mut buffer) {
-                            println!("   First {} bytes: {:?}", n, &buffer[..n]);
-                            
-                            // Check for r1cs magic number (first 4 bytes should be "r1cs" in ASCII)
-                            if n >= 4 && &buffer[0..4] == b"r1cs" {
-                                println!("   File has correct r1cs magic number");
-                            } else {
-                                println!("   File does NOT have correct r1cs magic number");
-                                println!("   Expected: [114, 49, 99, 115] (ASCII 'r1cs')");
-                            }
-                        }
-                    }
-                }
-            }
-            
             return Err(e);
         }
     };
