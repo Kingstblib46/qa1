@@ -3,14 +3,14 @@ mod r1cs;
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_ff::{PrimeField, BigInteger}; // BigInteger is used for val.into_bigint()
 use ark_groth16::{prepare_verifying_key, Groth16};
-use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use ark_snark::SNARK;
 
 use ark_circom::WitnessCalculator;
-use num_bigint::BigInt; // num_bigint::BigInt is used for calculated_witness_bigint and input parsing
+use num_bigint::BigInt as NumBigInt; // Renamed to avoid confusion with ark_ff::BigInteger
 use std::str::FromStr;
 
 // For parsing JSON inputs
@@ -53,45 +53,43 @@ impl CircuitFromR1CS {
             return Err(io::Error::new(ErrorKind::NotFound, error_msg));
         }
 
-        // Create a Wasmer store
         let mut store = Store::default();
-
-        let mut witness_calculator = WitnessCalculator::new(&mut store, &wasm_file_path) // Pass store here
+        let mut witness_calculator = WitnessCalculator::new(&mut store, &wasm_file_path)
             .map_err(|e| io::Error::new(ErrorKind::Other, format!("Failed to load WASM: {:?}", e)))?;
 
-        let inputs_json_str = r#"{"in": ["0", "1", "0", "1"]}"#;
+        let inputs_json_str = r#"{"sel": ["0"]}"#; 
         println!("  Using private inputs for witness calculation: {}", inputs_json_str);
 
-        // Parse JSON string into HashMap<String, Vec<BigInt>>
         let parsed_inputs_map: HashMap<String, JsonValue> = serde_json::from_str(inputs_json_str)
             .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("Failed to parse inputs JSON: {}", e)))?;
         
-        let mut inputs_for_calculator: Vec<(String, Vec<BigInt>)> = Vec::new();
-        for (key, json_val_array) in parsed_inputs_map {
-            if let JsonValue::Array(string_array) = json_val_array {
-                let bigint_vec: Result<Vec<BigInt>, _> = string_array.into_iter()
-                    .map(|s_val| {
-                        if let JsonValue::String(s) = s_val {
-                            BigInt::from_str(&s).map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("Failed to parse BigInt string '{}': {}", s, e)))
-                        } else {
-                            Err(io::Error::new(ErrorKind::InvalidInput, "Input array element not a string"))
-                        }
-                    })
-                    .collect();
-                inputs_for_calculator.push((key, bigint_vec?));
+        let mut inputs_for_calculator: Vec<(String, Vec<NumBigInt>)> = Vec::new();
+        for (key, json_val_or_array) in parsed_inputs_map {
+            let mut current_signal_values = Vec::new();
+            if let JsonValue::Array(string_array) = json_val_or_array {
+                for s_val in string_array {
+                    if let JsonValue::String(s) = s_val {
+                        current_signal_values.push(NumBigInt::from_str(&s).map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("Failed to parse NumBigInt string '{}': {}", s, e)))?);
+                    } else {
+                        return Err(io::Error::new(ErrorKind::InvalidInput, "Input array element not a string"));
+                    }
+                }
+            } else if let JsonValue::String(s_val) = json_val_or_array {
+                 current_signal_values.push(NumBigInt::from_str(&s_val).map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("Failed to parse NumBigInt string '{}': {}", s_val, e)))?);
             } else {
-                return Err(io::Error::new(ErrorKind::InvalidInput, format!("JSON value for key '{}' is not an array", key)));
+                return Err(io::Error::new(ErrorKind::InvalidInput, format!("JSON value for key '{}' is not a string or an array of strings", key)));
             }
+            inputs_for_calculator.push((key, current_signal_values));
         }
         
         println!("  Parsed inputs for calculator: {:?}", inputs_for_calculator);
 
-        let calculated_witness_bigint: Vec<num_bigint::BigInt> = witness_calculator
-            .calculate_witness(&mut store, inputs_for_calculator, false) // Use calculate_witness and pass store
-            .map_err(|e| io::Error::new(ErrorKind::Other, format!("Witness calculation failed: {:?}", e)))?;
+        let calculated_witness_bigint: Vec<NumBigInt> = witness_calculator
+            .calculate_witness(&mut store, inputs_for_calculator, true) 
+            .map_err(|e| io::Error::new(ErrorKind::Other, format!("Witness calculation failed (sanity check enabled): {:?}", e)))?;
 
         println!("  Raw witness calculated ({} values):", calculated_witness_bigint.len());
-        for (i, val) in calculated_witness_bigint.iter().enumerate().take(10) {
+        for (i, val) in calculated_witness_bigint.iter().enumerate().take(10.min(calculated_witness_bigint.len())) { // Print up to 10 or length
             println!("    raw_w[{}] = {}", i, val);
         }
 
@@ -109,13 +107,13 @@ impl CircuitFromR1CS {
             .into_iter()
             .map(|bi| {
                 Fr::from_str(&bi.to_string())
-                    .unwrap_or_else(|e| panic!("Failed to convert BigInt {} to Fr: {:?}", bi, e))
+                    .unwrap_or_else(|e| panic!("Failed to convert NumBigInt {} to Fr: {:?}", bi, e))
             })
             .collect();
 
-        println!("  Converted witness values (Fr):");
-        for (i, val) in witness_values_fr.iter().enumerate().take(r1cs_data.num_wires() as usize) {
-            println!("    w[{}] = {:?}", i, val.into_bigint()); // .into_bigint() uses ark_ff::BigInteger
+        println!("  Converted witness values (Fr) ({} values):", witness_values_fr.len());
+        for (i, val) in witness_values_fr.iter().enumerate() { // Print all Fr witness values
+            println!("    witness_values_fr[{}] (w[{}]) = {:?}", i, i, val.into_bigint());
         }
 
         Ok(Self {
@@ -125,29 +123,42 @@ impl CircuitFromR1CS {
     }
 
     fn get_public_inputs(&self) -> Vec<Fr> {
+        println!("  Extracting public inputs for verification from witness_values:");
         let mut public_inputs = Vec::new();
 
         let num_pub_out = self.r1cs.num_public_outputs() as usize;
-        let num_pub_in = self.r1cs.num_public_inputs() as usize;
+        // Based on R1CS for Decoder@multiplexer, num_pub_in is 0.
+        // let num_pub_in_from_r1cs = self.r1cs.num_public_inputs() as usize; 
 
-        for i in 1..=(num_pub_out) {
+        // Circom witness structure: w[0] is 1, w[1]...w[num_pub_out] are public outputs.
+        // Then w[num_pub_out+1]...w[num_pub_out+num_pub_in_from_r1cs] would be public inputs from R1CS.
+        // Arkworks Groth16 verification expects public inputs in the order: [public outputs, public inputs from R1CS]
+        
+        println!("    Number of public outputs from R1CS: {}", num_pub_out);
+        for i in 1..=num_pub_out { // Public outputs start at witness_values[1]
             if i < self.witness_values.len() {
                 public_inputs.push(self.witness_values[i]);
+                println!("      Added witness_values[{}] ({:?}) as public output for verification.", i, self.witness_values[i].into_bigint());
             } else {
-                eprintln!("Warning: Accessing witness_values out of bounds for public output index {}", i);
+                eprintln!("      Warning: Accessing witness_values out of bounds for public output index {}", i);
             }
         }
-        for i in (num_pub_out + 1)..=(num_pub_out + num_pub_in) {
-            if i < self.witness_values.len() {
-                public_inputs.push(self.witness_values[i]);
-            } else {
-                eprintln!("Warning: Accessing witness_values out of bounds for public input index {}", i);
-            }
-        }
+        
+        // This loop will not run for Decoder@multiplexer as num_public_inputs is 0
+        // let r1cs_pub_inputs_start_idx = 1 + num_pub_out;
+        // for i in 0..num_pub_in_from_r1cs {
+        //     let witness_idx = r1cs_pub_inputs_start_idx + i;
+        //     if witness_idx < self.witness_values.len() {
+        //         public_inputs.push(self.witness_values[witness_idx]);
+        //         println!("      Added witness_values[{}] ({:?}) as R1CS public input for verification.", witness_idx, self.witness_values[witness_idx].into_bigint());
+        //     } else {
+        //          eprintln!("      Warning: Accessing witness_values out of bounds for R1CS public input index {}", witness_idx);
+        //     }
+        // }
 
-        println!("  Extracted public inputs for verification ({} values):", public_inputs.len());
+        println!("  Final extracted public inputs for verification ({} values):", public_inputs.len());
         for (i, pi) in public_inputs.iter().enumerate() {
-            println!("    ark_pi[{}] = {:?}", i, pi.into_bigint());
+            println!("    ark_pi_for_verification[{}] = {:?}", i, pi.into_bigint());
         }
         public_inputs
     }
@@ -159,102 +170,163 @@ impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
         cs: ConstraintSystemRef<Fr>,
     ) -> Result<(), SynthesisError> {
         println!("Generating constraints for R1CS circuit...");
+        println!("  Initial CS state: num_instance_vars={}, num_witness_vars={}, num_constraints={}",
+                 cs.num_instance_variables(), cs.num_witness_variables(), cs.num_constraints());
 
-        let num_total_wires = self.r1cs.num_wires() as usize;
-        let num_public_circuit_outputs = self.r1cs.num_public_outputs() as usize;
-        let num_public_circuit_inputs = self.r1cs.num_public_inputs() as usize;
+        let num_total_wires = self.r1cs.num_wires() as usize; // e.g., 5 for Decoder@multiplexer
+        let num_public_circuit_outputs = self.r1cs.num_public_outputs() as usize; // e.g., 3
+        let num_public_circuit_inputs = self.r1cs.num_public_inputs() as usize; // e.g., 0
 
-        let num_ark_public_vars = 1 + num_public_circuit_outputs + num_public_circuit_inputs;
+        // This is the count of variables that will be cs.new_input_variable()
+        // This counts the public outputs and R1CS public inputs.
+        // The 'one' variable is already provided by cs.one() / Instance(0).
+        let num_additional_ark_instance_vars_to_allocate = num_public_circuit_outputs + num_public_circuit_inputs;
+        let expected_total_ark_instance_vars = 1 + num_additional_ark_instance_vars_to_allocate;
+
 
         println!(
-            "  Allocating {} total wires for CS. Witness vector length: {}",
+            "  R1CS wires: {}, Witness vector length: {}",
             num_total_wires, self.witness_values.len()
         );
         println!(
-            "  Circuit public outputs: {}, Circuit public inputs: {}",
+            "  R1CS public outputs: {}, R1CS public inputs: {}",
             num_public_circuit_outputs, num_public_circuit_inputs
         );
-        println!("  Arkworks public variables to allocate: {}", num_ark_public_vars);
+        println!("  Expected total Arkworks Instance Variables (1 (for cs.one()) + outs + ins): {}", expected_total_ark_instance_vars);
 
         let mut variables = Vec::with_capacity(num_total_wires);
 
-        let one_val = self.witness_values.get(0).cloned().ok_or(SynthesisError::AssignmentMissing)?;
-        if one_val != Fr::from(1u64) {
-            eprintln!("Warning: Expected witness_values[0] to be Fr::one(), but got {:?}", one_val.into_bigint());
+        // Wire 0: Constant One. Use Variable::One which represents the existing Instance(0).
+        println!("  Allocating CS variables from witness_values (length {}):", self.witness_values.len());
+        let one_val_from_witness = self.witness_values.get(0).cloned().ok_or_else(|| {
+            eprintln!("Error: witness_values[0] (constant one) is missing.");
+            SynthesisError::AssignmentMissing
+        })?;
+        if one_val_from_witness != Fr::from(1u64) {
+            eprintln!("Warning: Expected witness_values[0] to be Fr::one(), but got {:?}", one_val_from_witness.into_bigint());
         }
-        let var_one = cs.new_input_variable(|| Ok(one_val))?;
-        variables.push(var_one);
-        println!("    Allocated var_one (w[0]): {:?}", one_val.into_bigint());
+        
+        let var_one_cs = Variable::One; // Corrected: Use Variable::One
+        variables.push(var_one_cs);
+        // Note: cs.num_instance_variables() will still be 1 here, as Variable::One refers to the *existing* Instance(0).
+        // The count increases when cs.new_input_variable() is called.
+        println!("    w[0] (val:{:?}) -> mapped to CS ONE Var: {:?} (initial cs.num_instance_vars: {})", one_val_from_witness.into_bigint(), var_one_cs, cs.num_instance_variables());
 
+
+        // Public outputs of the circuit (Instance variables in Arkworks, starting from Instance(1))
         for i in 1..=num_public_circuit_outputs {
-            let val = self.witness_values.get(i).cloned().ok_or(SynthesisError::AssignmentMissing)?;
-            variables.push(cs.new_input_variable(|| Ok(val))?);
-            println!("    Allocated public output (w[{}]) as input_var: {:?}", i, val.into_bigint());
+            let val = self.witness_values.get(i).cloned().ok_or_else(|| {
+                 eprintln!("Error: witness_values[{}] (public output) is missing.", i);
+                SynthesisError::AssignmentMissing
+            })?;
+            let var = cs.new_input_variable(|| Ok(val))?; // These will be Instance(1), Instance(2), ...
+            variables.push(var);
+            println!("    w[{}] (val:{:?}) -> CS Var: {:?} (current cs.num_instance_vars: {})", i, val.into_bigint(), var, cs.num_instance_variables());
         }
 
-        for i in (num_public_circuit_outputs + 1)..=(num_public_circuit_outputs + num_public_circuit_inputs) {
-            let val = self.witness_values.get(i).cloned().ok_or(SynthesisError::AssignmentMissing)?;
-            variables.push(cs.new_input_variable(|| Ok(val))?);
-            println!("    Allocated public input (w[{}]) as input_var: {:?}", i, val.into_bigint());
+        // Public inputs of the circuit (Instance variables in Arkworks)
+        // For Decoder@multiplexer, num_public_circuit_inputs is 0, so this loop won't run.
+        let r1cs_pub_ins_start_idx_in_witness = 1 + num_public_circuit_outputs;
+        for i in 0..num_public_circuit_inputs {
+            let witness_idx = r1cs_pub_ins_start_idx_in_witness + i;
+            let val = self.witness_values.get(witness_idx).cloned().ok_or_else(|| {
+                eprintln!("Error: witness_values[{}] (R1CS public input) is missing.", witness_idx);
+                SynthesisError::AssignmentMissing
+            })?;
+            let var = cs.new_input_variable(|| Ok(val))?;
+            variables.push(var);
+            println!("    w[{}] (val:{:?}) -> CS Var: {:?} (current cs.num_instance_vars: {})", witness_idx, val.into_bigint(), var, cs.num_instance_variables());
         }
-
-        let private_vars_start_idx = num_ark_public_vars;
-        for i in private_vars_start_idx..num_total_wires {
-            let val = self.witness_values.get(i).cloned().ok_or(SynthesisError::AssignmentMissing)?;
-            variables.push(cs.new_witness_variable(|| Ok(val))?);
-            println!("    Allocated private (w[{}]) as witness_var: {:?}", i, val.into_bigint());
+        
+        // Private inputs of the circuit (Witness variables in Arkworks)
+        let private_vars_start_idx_in_witness = 1 + num_public_circuit_outputs + num_public_circuit_inputs;
+        for i in private_vars_start_idx_in_witness..num_total_wires {
+            // i here is the witness_values index for private variables
+            let val = self.witness_values.get(i).cloned().ok_or_else(|| {
+                 eprintln!("Error: witness_values[{}] (private variable) is missing.", i);
+                SynthesisError::AssignmentMissing
+            })?;
+            let var = cs.new_witness_variable(|| Ok(val))?;
+            variables.push(var);
+            println!("    w[{}] (val:{:?}) -> CS Var: {:?} (current cs.num_witness_vars: {})", i, val.into_bigint(), var, cs.num_witness_variables());
         }
+        
+        println!("  After allocating all variables from witness_values:");
+        println!("    Total variables pushed to `variables` vector: {}", variables.len());
+        println!("    CS state: num_instance_vars={}, num_witness_vars={}, num_constraints={}",
+                 cs.num_instance_variables(), cs.num_witness_variables(), cs.num_constraints());
 
         if variables.len() != num_total_wires {
-            eprintln!("Error: Allocated {} variables in CS, but expected {} (num_total_wires)", variables.len(), num_total_wires);
+            eprintln!("Error: Allocated {} CS variables, but R1CS specifies {} total wires.", variables.len(), num_total_wires);
+            return Err(SynthesisError::UnconstrainedVariable); 
+        }
+        // Check against expected_total_ark_instance_vars
+        if cs.num_instance_variables() != expected_total_ark_instance_vars {
+             eprintln!("Error: CS has {} instance variables, but expected {}.", cs.num_instance_variables(), expected_total_ark_instance_vars);
+            return Err(SynthesisError::UnconstrainedVariable);
+        }
+        // The number of witness variables allocated by cs.new_witness_variable()
+        let expected_ark_witness_vars = num_total_wires - expected_total_ark_instance_vars;
+        if cs.num_witness_variables() != expected_ark_witness_vars {
+             eprintln!("Error: CS has {} witness variables, but expected {}.", cs.num_witness_variables(), expected_ark_witness_vars);
             return Err(SynthesisError::UnconstrainedVariable);
         }
 
-        println!("  Adding {} constraints to the circuit...", self.r1cs.constraints().len());
+
+        println!("  Adding {} R1CS constraints to the circuit...", self.r1cs.constraints().len());
         for (idx, constraint) in self.r1cs.constraints().iter().enumerate() {
             let mut a_lc = ark_relations::r1cs::LinearCombination::<Fr>::zero();
+            // println!("    Constraint #{}: A terms:", idx);
             for term in &constraint.a_terms {
                 if term.wire_id as usize >= variables.len() {
-                    eprintln!("Error: A-term wire_id {} out of bounds (vars len {}) for constraint {}", term.wire_id, variables.len(), idx);
+                    eprintln!("Error: A-term wire_id {} (0-indexed) out of bounds for `variables` vector (len {}) for constraint {}", term.wire_id, variables.len(), idx);
                     return Err(SynthesisError::AssignmentMissing);
                 }
+                // println!("      Adding A-term: coef={:?}, var_from_w[{}]={:?}", term.coefficient, term.wire_id, variables[term.wire_id as usize]);
                 a_lc += (term.coefficient, variables[term.wire_id as usize]);
             }
 
             let mut b_lc = ark_relations::r1cs::LinearCombination::<Fr>::zero();
+            // println!("    Constraint #{}: B terms:", idx);
             for term in &constraint.b_terms {
                 if term.wire_id as usize >= variables.len() {
-                    eprintln!("Error: B-term wire_id {} out of bounds (vars len {}) for constraint {}", term.wire_id, variables.len(), idx);
+                    eprintln!("Error: B-term wire_id {} (0-indexed) out of bounds for `variables` vector (len {}) for constraint {}", term.wire_id, variables.len(), idx);
                     return Err(SynthesisError::AssignmentMissing);
                 }
+                // println!("      Adding B-term: coef={:?}, var_from_w[{}]={:?}", term.coefficient, term.wire_id, variables[term.wire_id as usize]);
                 b_lc += (term.coefficient, variables[term.wire_id as usize]);
             }
 
             let mut c_lc = ark_relations::r1cs::LinearCombination::<Fr>::zero();
+            // println!("    Constraint #{}: C terms:", idx);
             for term in &constraint.c_terms {
                 if term.wire_id as usize >= variables.len() {
-                    eprintln!("Error: C-term wire_id {} out of bounds (vars len {}) for constraint {}", term.wire_id, variables.len(), idx);
+                    eprintln!("Error: C-term wire_id {} (0-indexed) out of bounds for `variables` vector (len {}) for constraint {}", term.wire_id, variables.len(), idx);
                     return Err(SynthesisError::AssignmentMissing);
                 }
+                // println!("      Adding C-term: coef={:?}, var_from_w[{}]={:?}", term.coefficient, term.wire_id, variables[term.wire_id as usize]);
                 c_lc += (term.coefficient, variables[term.wire_id as usize]);
             }
 
             cs.enforce_constraint(a_lc.clone(), b_lc.clone(), c_lc.clone())?;
 
-            if idx < 3 || idx == self.r1cs.constraints().len() - 1 {
-                println!("    Enforced constraint #{}: ({:?}) * ({:?}) = {:?}", idx, a_lc, b_lc, c_lc);
+            if idx < 3 || idx == self.r1cs.constraints().len() - 1 { // Print first 3 and last
+                println!("    Enforced R1CS constraint #{}: ({:?}) * ({:?}) = {:?}", idx, a_lc, b_lc, c_lc);
             } else if idx == 3 && self.r1cs.constraints().len() > 4 {
-                println!("    ... and {} more constraints", self.r1cs.constraints().len() - 4);
+                println!("    ... (constraints {} to {} not shown in detail) ...", idx, self.r1cs.constraints().len() - 2);
             }
         }
 
         println!("  Circuit constraint generation complete.");
+        println!("  Final CS state: num_instance_vars={}, num_witness_vars={}, num_constraints={}",
+                 cs.num_instance_variables(), cs.num_witness_variables(), cs.num_constraints());
         Ok(())
     }
 }
 
-#[tokio::main] // Add this attribute
-async fn main() -> io::Result<()> { // Make main async
+#[allow(unused_imports)] // Allow BigInteger for now
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let r1cs_file_path = PathBuf::from("/Users/hiranokaoru/localwork/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
     println!("📂 Using R1CS file: {}", r1cs_file_path.display());
 
@@ -282,11 +354,12 @@ async fn main() -> io::Result<()> { // Make main async
     println!("✅ Successfully generated Groth16 parameters");
 
     println!("\nRe-creating circuit for proving...");
-    let r1cs_data_for_proving = r1cs::R1CS::read(&r1cs_file_path)?;
+    // Need to re-read r1cs_data as it was moved into circuit_for_setup
+    let r1cs_data_for_proving = r1cs::R1CS::read(&r1cs_file_path)?; 
     let circuit_for_proving = CircuitFromR1CS::new(r1cs_data_for_proving, &r1cs_file_path)?;
 
     let public_inputs = circuit_for_proving.get_public_inputs();
-    println!("  Confirmed public inputs for proving: {} values.", public_inputs.len());
+    println!("  Confirmed public inputs for proving ({} values).", public_inputs.len());
 
     println!("\nGenerating Groth16 proof...");
     let proof = Groth16::<Bls12_381>::prove(&params, circuit_for_proving, &mut rng)
@@ -299,7 +372,7 @@ async fn main() -> io::Result<()> { // Make main async
     println!("\nVerifying proof locally...");
     let pvk = prepare_verifying_key(&params.vk);
 
-    match Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof) { // Remove .await
+    match Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof) {
         Ok(true) => println!("✅ Proof verified successfully!"),
         Ok(false) => {
             eprintln!("❌ Proof verification failed!");
