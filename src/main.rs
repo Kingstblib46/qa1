@@ -5,7 +5,7 @@ use ark_ff::{PrimeField, BigInteger}; // BigInteger is used for val.into_bigint(
 use ark_groth16::{prepare_verifying_key, Groth16};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Error as IoError};
 use std::path::{Path, PathBuf};
 use ark_snark::SNARK;
 
@@ -385,5 +385,120 @@ async fn main() -> io::Result<()> {
     }
 
     println!("\nR1CS processing complete!");
+
+    // === 4. 序列化为 Dogecoin OP_CHECKZKP 脚本推送格式 ===
+    {
+        use ark_ec::AffineRepr;
+        use ark_serialize::{CanonicalSerialize, Compress};
+        use std::fs::File;
+        use std::io::Write;
+
+        // 4.1 Proof 序列化（π_A, π_B, π_C 共 8 项）：48/96/48 bytes
+        let mut proof_bytes: Vec<Vec<u8>> = Vec::with_capacity(8);
+        // π_A (G1)
+        proof_bytes.push({
+            let mut v = Vec::new();
+            proof.a.x().unwrap().serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        });
+        proof_bytes.push({
+            let mut v = Vec::new();
+            proof.a.y().unwrap().serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        });
+        // π_B (G2: Fq2 拆 c0,c1)
+        {
+            let mut v = Vec::new();
+            proof.b.x().unwrap().c0.serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            proof.b.x().unwrap().c1.serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        }.chunks(48).for_each(|c| proof_bytes.push(c.to_vec()));
+        {
+            let mut v = Vec::new();
+            proof.b.y().unwrap().c0.serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            proof.b.y().unwrap().c1.serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        }.chunks(48).for_each(|c| proof_bytes.push(c.to_vec()));
+        // π_C (G1)
+        proof_bytes.push({
+            let mut v = Vec::new();
+            proof.c.x().unwrap().serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        });
+        proof_bytes.push({
+            let mut v = Vec::new();
+            proof.c.y().unwrap().serialize_with_mode(&mut v, Compress::Yes).unwrap();
+            v
+        });
+        assert_eq!(proof_bytes.len(), 8, "proof_bytes.len() 必须是 8");
+
+        // 4.2 Public inputs 序列化（每个 Fr 32 字节 LE 前填零）
+        fn fr_to_32le(f: &Fr) -> Vec<u8> {
+            let mut b = f.into_bigint().to_bytes_le();
+            let mut z = vec![0u8; 32 - b.len()];
+            z.append(&mut b);
+            z
+        }
+        let mut pubi_bytes = public_inputs.iter().map(fr_to_32le).collect::<Vec<_>>();
+        assert_eq!(pubi_bytes.len(), 3 /* 改成电路public output个数 */);
+
+        // 4.3 VK 序列化：alpha_g1(48) + beta_g2(96) + gamma_g2(96) + delta_g2(96) + gamma_abc_g1*(n_pub+1)*48
+        let mut vk_bytes = Vec::new();
+        params.vk.alpha_g1
+            .serialize_compressed(&mut vk_bytes)
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("alpha_g1 serialization failed: {}", e)))?;
+        params.vk.beta_g2
+            .serialize_compressed(&mut vk_bytes)
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("beta_g2 serialization failed: {}", e)))?;
+        params.vk.gamma_g2
+            .serialize_compressed(&mut vk_bytes)
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("gamma_g2 serialization failed: {}", e)))?;
+        params.vk.delta_g2
+            .serialize_compressed(&mut vk_bytes)
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("delta_g2 serialization failed: {}", e)))?;
+        for (i, g1) in params.vk.gamma_abc_g1.iter().enumerate() {
+            g1.serialize_compressed(&mut vk_bytes)
+                .map_err(|e| IoError::new(
+                    ErrorKind::Other,
+                    format!("gamma_abc_g1[{}] serialization failed: {}", i, e),
+                ))?;
+        }
+
+        // 分 chunk 为 80 字节一段
+        let vk_chunks = vk_bytes.chunks(80).map(|c| c.to_vec()).collect::<Vec<_>>();
+        assert_eq!(vk_chunks.len(),  (vk_bytes.len() + 79) / 80);
+
+        // 4.4 按 OP_CHECKZKP Mode=0 顺序组装，最终栈项列表
+        //   [proof…(8)][pubi…][vk_chunks…][mode=0]
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        // proof 从末尾开始推
+        for chunk in proof_bytes.into_iter().rev() { stack.push(chunk); }
+        // public inputs
+        for chunk in pubi_bytes.into_iter().rev() { stack.push(chunk); }
+        // vk chunks
+        for chunk in vk_chunks.into_iter().rev() { stack.push(chunk); }
+        // 最后推 mode=0
+        stack.push(vec![0u8]);
+
+        // 4.5 Hex 编码并输出到严格命名的文件
+        let txt_path = "/Users/hiranokaoru/localwork/work/qa1/zkp_stack_dip69.txt";
+        let mut f = File::create(txt_path)?;
+        for (i, item) in stack.iter().enumerate() {
+            writeln!(f, "{}:{}", i, hex::encode(item))?;
+        }
+        println!("✅ 已生成 Dogecoin 脚本推送数据：{}", txt_path);
+
+        // 同时写入严格命名的 JSON
+        let json_path = "/Users/hiranokaoru/localwork/work/qa1/zkp_stack_dip69.json";
+        let mut jf = File::create(json_path)?;
+        let hex_list: Vec<String> = stack.iter()
+            .map(|item| hex::encode(item))
+            .collect();
+        serde_json::to_writer_pretty(&mut jf, &hex_list)
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("写入 JSON 失败: {}", e)))?;
+        println!("✅ 已生成 JSON 脚本推送数据：{}", json_path);
+
+    }
+
     Ok(())
 }
