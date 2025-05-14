@@ -18,3 +18,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 byteorder = "1.4" # For binary parsing of R1CS file
 r1cs-file = "0.3.0" # For parsing R1CS files according to iden3 format
+ark-circom = "0.5.0" # For Circom compatibility (matches arkworks 0.4.0 versions)
+num-bigint = "0.4" # Required by ark-circom for witness values
+wasmer = "4.2.0" # Required by ark-circom 0.5.0 for WitnessCalculator
+tokio = { version = "1", features = ["full"] } # Add tokio

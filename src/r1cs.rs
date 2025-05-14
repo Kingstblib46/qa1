@@ -5,7 +5,7 @@ use std::fmt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ark_bls12_381::Fr;
 use ark_ff::{PrimeField, Zero};
-use ark_serialize::{CanonicalDeserialize, SerializationError};
+use ark_serialize::SerializationError;
 
 /// Wrapper for R1CS file data with additional utility methods
 pub struct R1CS {
@@ -22,7 +22,6 @@ pub struct R1CSHeader {
     pub n_pub_out: u32,
     pub n_pub_in: u32,
     pub n_prvt_in: u32,
-    pub n_labels: u64,
     pub n_constraints: u32,
 }
 
@@ -210,8 +209,7 @@ impl R1CS {
         println!("  Number of private inputs: {}", n_prvt_in);
         
         // Read number of labels
-        let n_labels = file.read_u64::<LittleEndian>()?;
-        println!("  Number of labels: {}", n_labels);
+        let _n_labels = file.read_u64::<LittleEndian>()?; // Read but ignore if not used
         
         // Read number of constraints
         let n_constraints = file.read_u32::<LittleEndian>()?;
@@ -224,7 +222,6 @@ impl R1CS {
             n_pub_out,
             n_pub_in,
             n_prvt_in,
-            n_labels,
             n_constraints,
         })
     }
@@ -336,11 +333,6 @@ impl R1CS {
         self.header.n_pub_in
     }
     
-    /// Get the total number of public values (outputs + inputs)
-    pub fn num_public_values(&self) -> u32 {
-        self.header.n_pub_out + self.header.n_pub_in
-    }
-    
     /// Get the number of private inputs in the circuit
     pub fn num_private_inputs(&self) -> u32 {
         self.header.n_prvt_in
@@ -388,16 +380,4 @@ impl R1CS {
             }
         }
     }
-}
-
-/// Simple A+B=C circuit for testing when no R1CS file is available
-pub fn create_hardcoded_r1cs() -> io::Result<R1CS> {
-    println!("Creating hardcoded R1CS for testing purposes...");
-    
-    // For now we'll just return an error - if needed, we can implement
-    // a hardcoded simple circuit later
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "Hardcoded R1CS not implemented - please provide a valid R1CS file"
-    ))
 }
