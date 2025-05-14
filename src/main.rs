@@ -20,29 +20,37 @@ use std::collections::HashMap;
 // Wasmer store for WitnessCalculator
 use wasmer::Store;
 
+use std::env;
+
 struct CircuitFromR1CS {
     r1cs: r1cs::R1CS,
     witness_values: Vec<Fr>,
 }
 
 impl CircuitFromR1CS {
-    fn new(r1cs_data: r1cs::R1CS, r1cs_file_path: &Path) -> io::Result<Self> {
-        println!("Initializing CircuitFromR1CS with witness calculation...");
+    // 增加一个可选 wasm_path 参数
+    fn new(
+        r1cs_data: r1cs::R1CS,
+        r1cs_file_path: &Path,
+        wasm_file_path_opt: Option<&Path>,
+    ) -> io::Result<Self> {
+        println!("Initializing CircuitFromR1CS with witness calculation…");
 
-        let wasm_file_path = {
+        // 如果命令行给了 wasm 路径，就用它，否则按原逻辑自动推断
+        let wasm_file_path = if let Some(p) = wasm_file_path_opt {
+            p.to_path_buf()
+        } else {
             let parent_dir = r1cs_file_path.parent().ok_or_else(|| {
                 io::Error::new(ErrorKind::NotFound, "R1CS parent directory not found")
             })?;
-            let circuit_name_stem = r1cs_file_path.file_stem().ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidInput, "Could not extract R1CS file stem")
-            })?;
-            let circuit_name = circuit_name_stem.to_str().unwrap_or("circuit");
-            parent_dir
-                .join(format!("{}_js", circuit_name))
-                .join(format!("{}.wasm", circuit_name))
+            let stem = r1cs_file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Bad R1CS file stem"))?;
+            parent_dir.join(format!("{}_js/{}.wasm", stem, stem))
         };
 
-        println!("  Attempting to use WASM file: {}", wasm_file_path.display());
+        println!("  Using WASM file: {}", wasm_file_path.display());
 
         if !wasm_file_path.exists() {
             let error_msg = format!(
@@ -327,18 +335,24 @@ impl ConstraintSynthesizer<Fr> for CircuitFromR1CS {
 #[allow(unused_imports)] // Allow BigInteger for now
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let r1cs_file_path = PathBuf::from("/Users/hiranokaoru/localwork/work/circomlib-cff5ab6/Decoder@multiplexer.r1cs");
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 || args.len() > 3 {
+        eprintln!("用法: {} <circuit.r1cs> [circuit.wasm]", args[0]);
+        std::process::exit(1);
+    }
+    // 必填 R1CS 路径
+    let r1cs_file_path = PathBuf::from(&args[1]);
+    // 可选 WASM 路径
+    let wasm_opt: Option<&Path> = args.get(2).map(|s| Path::new(s));
+
     println!("📂 Using R1CS file: {}", r1cs_file_path.display());
 
-    let r1cs_data = r1cs::R1CS::read(&r1cs_file_path).map_err(|e| {
-        eprintln!("❌ Failed to read R1CS file: {}", e);
-        e
-    })?;
-    println!("✅ Successfully parsed R1CS file structure");
-    r1cs_data.print_info();
+    let r1cs_data = r1cs::R1CS::read(&r1cs_file_path)
+        .map_err(|e| { eprintln!("❌ Failed to read R1CS file: {}", e); e })?;
+    println!("✅ Parsed R1CS, constraints = {}", r1cs_data.num_constraints());
 
-    println!("\nCreating circuit from R1CS with WASM witness generation...");
-    let circuit_for_setup = CircuitFromR1CS::new(r1cs_data, &r1cs_file_path)?;
+    println!("\nCreating circuit from R1CS…");
+    let circuit_for_setup = CircuitFromR1CS::new(r1cs_data, &r1cs_file_path, wasm_opt)?;
 
     println!("\nRunning Groth16 setup...");
     let mut rng = StdRng::seed_from_u64(123456789);
@@ -355,8 +369,8 @@ async fn main() -> io::Result<()> {
 
     println!("\nRe-creating circuit for proving...");
     // Need to re-read r1cs_data as it was moved into circuit_for_setup
-    let r1cs_data_for_proving = r1cs::R1CS::read(&r1cs_file_path)?; 
-    let circuit_for_proving = CircuitFromR1CS::new(r1cs_data_for_proving, &r1cs_file_path)?;
+    let r1cs_data2 = r1cs::R1CS::read(&r1cs_file_path)?;
+    let circuit_for_proving = CircuitFromR1CS::new(r1cs_data2, &r1cs_file_path, wasm_opt)?;
 
     let public_inputs = circuit_for_proving.get_public_inputs();
     println!("  Confirmed public inputs for proving ({} values).", public_inputs.len());
@@ -439,8 +453,14 @@ async fn main() -> io::Result<()> {
             z.append(&mut b);
             z
         }
-        let mut pubi_bytes = public_inputs.iter().map(fr_to_32le).collect::<Vec<_>>();
-        assert_eq!(pubi_bytes.len(), 3 /* 改成电路public output个数 */);
+        let pubi_bytes = public_inputs.iter().map(fr_to_32le).collect::<Vec<_>>();
+        assert_eq!(
+            pubi_bytes.len(),
+            public_inputs.len(),
+            "Expected {} public inputs, got {}",
+            public_inputs.len(),
+            pubi_bytes.len()
+        );
 
         // 4.3 VK 序列化：alpha_g1(48) + beta_g2(96) + gamma_g2(96) + delta_g2(96) + gamma_abc_g1*(n_pub+1)*48
         let mut vk_bytes = Vec::new();
